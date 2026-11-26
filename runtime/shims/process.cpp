@@ -11,8 +11,8 @@
 //     shares with gta6rt. exit() runs it newest first, as the CRT does, before the run ends; _exit(), _Exit(),
 //     quick_exit(), ExitProcess() and abort() do not. _cexit() runs it and returns, _c_exit() returns. A second
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
-//     CRT's exit lock. Not covered yet: at_quick_exit() handlers (quick_exit() runs none) and the thread-local
-//     destructor callback (_register_thread_local_exe_atexit_callback); both still reach the host CRT.
+//     CRT's exit lock. The thread-local destructor callback is kept here too, one per thread, and run by the
+//     loader when that thread ends. Not covered yet: at_quick_exit() handlers (quick_exit() runs none).
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
@@ -135,6 +135,22 @@ void run_atexit_handlers() {
 int __cdecl game_crt_atexit(AtexitFn fn) {
     return fn && register_atexit(fn) ? 0 : -1;
 }
+
+// UCRT: _tls_callback_fn _register_thread_local_exe_atexit_callback(_tls_callback_fn), the previous one back. The
+// UCRT keeps one callback per thread and runs it when that thread ends, for the thread_local destructors of an EXE;
+// it is also where a title that a shim has to answer reaches ucrtbase!terminate, whose UCRT-side consistency check
+// fails in this process (ucrtbase!abort, FAST_FAIL_FATAL_APP_EXIT, before any D3D12 call: measured on 1.0.2.1 with
+// the 14.29 runtime the package ships against this host's UCRT). Keeping the registration here, per thread, leaves
+// the CRT out of it.
+using TlsCallbackFn = void(__cdecl*)();
+thread_local TlsCallbackFn g_thread_local_exe_atexit_callback = nullptr;
+
+TlsCallbackFn __cdecl game_register_thread_local_exe_atexit_callback(TlsCallbackFn callback) {
+    TlsCallbackFn previous = g_thread_local_exe_atexit_callback;
+    g_thread_local_exe_atexit_callback = callback;
+    return previous;
+}
+
 // msvcrt.dll (MinGW): int atexit(void (*)(void)) and _onexit_t _onexit(_onexit_t).
 int __cdecl game_msvcrt_atexit(AtexitFn fn) { return game_crt_atexit(fn); }
 OnexitFn __cdecl game_onexit(OnexitFn fn) {
@@ -482,6 +498,14 @@ int run_entry(void* entry, size_t stack_bytes) {
     return g_exit_code.load();
 }
 
+// Outside the anonymous namespace: the loader calls it when a thread ends (process_shim.h).
+void run_thread_local_exe_atexit_callback() {
+    if (TlsCallbackFn callback = g_thread_local_exe_atexit_callback) {
+        g_thread_local_exe_atexit_callback = nullptr;  // once, even if it throws
+        callback();
+    }
+}
+
 }  // namespace rt::process
 
 namespace {
@@ -491,6 +515,7 @@ using namespace rt::process;
     {dll, "_Exit", reinterpret_cast<void*>(&game_quick_exit)}, \
     {dll, "quick_exit", reinterpret_cast<void*>(&game_quick_exit)}, \
     {dll, "_crt_atexit", reinterpret_cast<void*>(&game_crt_atexit)}, \
+    {dll, "_register_thread_local_exe_atexit_callback", reinterpret_cast<void*>(&game_register_thread_local_exe_atexit_callback)}, \
     {dll, "_cexit", reinterpret_cast<void*>(&game_cexit)}, {dll, "_c_exit", reinterpret_cast<void*>(&game_c_exit)}, \
     {dll, "abort", reinterpret_cast<void*>(&game_abort)}, {dll, "__p___argc", reinterpret_cast<void*>(&game_p_argc)}, \
     {dll, "__p___argv", reinterpret_cast<void*>(&game_p_argv)}, \

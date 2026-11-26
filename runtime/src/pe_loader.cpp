@@ -1,4 +1,4 @@
-#include "pe_loader.h"
+﻿#include "pe_loader.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -16,6 +16,7 @@
 #include <system_error>
 #include <vector>
 
+#include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
@@ -1205,6 +1206,13 @@ void __cdecl on_host_thread_event(DWORD reason) {
                 release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
             }
         }
+        // The executable's thread-local destructors, which its CRT would run at this point: after the DLL slots'
+        // callbacks, on the thread that is ending. A throw from one must not leave the Windows loader lock held.
+        try {
+            rt::process::run_thread_local_exe_atexit_callback();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: thread detach, thread-local exe-atexit callback: %s\n", e.what());
+        }
     }
 }
 
@@ -1450,7 +1458,7 @@ Module* Loader::find_narrow_module(const std::string& dll_lower) const {
     for (const auto& entry : by_name_)
         if (entry.second->narrow_key == dll_lower) return entry.second;
     // The key is ASCII case-folded only. A name with letters outside ASCII (Cyrillic in code page 1251, say)
-    // compares case-insensitively through the code page, as GetModuleHandleA does: GUEST_ДА.EXE finds guest_да.exe.
+    // compares case-insensitively through the code page, as GetModuleHandleA does: GUEST_Ð”Ð.EXE finds guest_Ð´Ð°.exe.
     // Widening the folded key is safe here: rt::lower() folds ASCII letters only, and no ANSI code page's multibyte
     // sequences contain ASCII letter bytes, so both sides widen to the same characters they were spelt with.
     if (const std::wstring wide = acp_to_wide(dll_lower); !wide.empty())

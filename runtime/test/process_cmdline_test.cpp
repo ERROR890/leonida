@@ -439,6 +439,55 @@ int main() {
         SetProcessAffinityMask(GetCurrentProcess(), process_mask);
     }
 
+    // The thread-local destructor callback a title registers: the shim keeps it per thread instead of letting the
+    // UCRT hold it, registering returns the previous one and runs nothing yet, and the runner runs the current one
+    // once (the loader calls the runner when a thread ends).
+    {
+        using TlsFn = void(__cdecl*)();
+        using RegisterFn = TlsFn(__cdecl*)(TlsFn);
+        const auto reg =
+            reinterpret_cast<RegisterFn>(rt::shims::find("ucrtbase.dll", "_register_thread_local_exe_atexit_callback"));
+        if (!reg) {
+            std::fprintf(stderr, "FAIL missing _register_thread_local_exe_atexit_callback shim\n");
+            ++failures;
+        } else {
+            static int ran = 0;
+            TlsFn first = +[] { ++ran; };
+            if (reg(first) != nullptr) {
+                std::fprintf(stderr, "FAIL the first registration did not return no previous callback\n");
+                ++failures;
+            }
+            if (ran != 0) {
+                std::fprintf(stderr, "FAIL the callback ran before the thread ended\n");
+                ++failures;
+            }
+            rt::process::run_thread_local_exe_atexit_callback();
+            if (ran != 1) {
+                std::fprintf(stderr, "FAIL the runner ran the callback %d time(s), not once\n", ran);
+                ++failures;
+            }
+            rt::process::run_thread_local_exe_atexit_callback();
+            if (ran != 1) {
+                std::fprintf(stderr, "FAIL the runner ran the callback again (%d)\n", ran);
+                ++failures;
+            }
+            TlsFn second = +[] { };
+            if (reg(second) != nullptr) {
+                std::fprintf(stderr, "FAIL a registration after the run did not return no previous callback\n");
+                ++failures;
+            }
+            if (reg(first) != second) {
+                std::fprintf(stderr, "FAIL a registration did not return the callback it replaces\n");
+                ++failures;
+            }
+            rt::process::run_thread_local_exe_atexit_callback();
+            if (ran != 2) {
+                std::fprintf(stderr, "FAIL the runner ran the replacing callback %d time(s), not once\n", ran);
+                ++failures;
+            }
+        }
+    }
+
     if (failures) return 1;
     std::printf("process_cmdline: GetCommandLineW parses back to __wargv, non-ASCII arguments intact (code page %u); "
                 "the WinMain line and the kernelbase/API-set names are the game's\n",

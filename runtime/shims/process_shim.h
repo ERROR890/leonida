@@ -16,4 +16,9 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
 // the first of those happens; other game threads are left running (the host process ends them when it exits).
 int run_entry(void* entry, std::size_t stack_bytes = 8u << 20);
 
+// The thread-local destructor callback the game registered with _register_thread_local_exe_atexit_callback, run on
+// the thread that registered it and at most once. The loader calls it for a thread that ends; the game's own exit
+// does not run it, as with the UCRT, whose thread events only fire when the thread ends.
+void run_thread_local_exe_atexit_callback();
+
 }  // namespace rt::process
