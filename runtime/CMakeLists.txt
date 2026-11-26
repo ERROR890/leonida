@@ -896,6 +896,10 @@ if(BUILD_TESTING)
     add_test(NAME compile_helper COMMAND compile_helper_test)
   endif()
 
+  # D24/D16 fragment depth quantisation and bias SPIR-V patcher (runtime/src/depth24_fragment.h): pure stdlib.
+  add_executable(depth24_fragment_test test/depth24_fragment_test.cpp)
+  add_test(NAME depth24_fragment COMMAND depth24_fragment_test)
+
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 
@@ -3732,18 +3736,6 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_unmapped_vsharp_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_unmapped_vsharp COMMAND d3d12_unmapped_vsharp_test)
     set_tests_properties(d3d12_unmapped_vsharp PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_CONSOLE_FIX_US=0")
-    # The host-RAM mirror of a console heap's GPU copy (src/console_heap_copy.h) agrees with the copy through the first
-    # refresh, title writes and a filtered release sweep; run again without the mirror, where the copy must not change.
-    add_executable(d3d12_console_heap_mirror_test test/d3d12_console_heap_mirror_test.cpp shims/d3d12_xs_device.cpp)
-    target_link_libraries(d3d12_console_heap_mirror_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
-    target_compile_definitions(d3d12_console_heap_mirror_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
-    target_compile_options(d3d12_console_heap_mirror_test PRIVATE /W4 /permissive- /utf-8)
-    add_test(NAME d3d12_console_heap_mirror COMMAND d3d12_console_heap_mirror_test)
-    set_tests_properties(d3d12_console_heap_mirror PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
-                         "LEONIDA_CONSOLE_FIX_US=0;LEONIDA_CONSOLE_RELEASE_FILTER=1;LEONIDA_HEAP_MIRROR_CHECK=1")
-    add_test(NAME d3d12_console_heap_mirror_off COMMAND d3d12_console_heap_mirror_test)
-    set_tests_properties(d3d12_console_heap_mirror_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
-                         "LEONIDA_CONSOLE_FIX_US=0;LEONIDA_CONSOLE_RELEASE_FILTER=1;LEONIDA_HEAP_MIRROR=0")
     add_executable(d3d12_indirect_zero_test test/d3d12_indirect_zero_test.cpp)
     target_link_libraries(d3d12_indirect_zero_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_indirect_zero_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -3919,6 +3911,12 @@ if(TARGET Vulkan::Headers)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # Two shadows over one page share their sums: a newly filled one must still follow the title's bytes, with
+      # LEONIDA_SHADOW_KEEP on and off (review by lixonik).
+      add_test(NAME d3d12_shadow_keep_refill COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=1")
+      add_test(NAME d3d12_shadow_keep_refill_off COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=0")
       add_test(NAME d3d12_api_descriptor_copy COMMAND d3d12_title_va_test --api-descriptor-copy)
       set_tests_properties(d3d12_api_descriptor_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
       add_test(NAME d3d12_api_descriptor_copy_off COMMAND d3d12_title_va_test --api-descriptor-copy-off)
@@ -4369,6 +4367,18 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com user32)  # user32: the PresentX window
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
 
+      # gta6rt --precompile-pipelines builds the programs LEONIDA_SKIP_COMPUTE names unless --skip-listed is given,
+      # and its last line counts both (shims/d3d12_precompile.h). Two synthetic compute modules, three runs.
+      if(TARGET gta6rt_compute_journal_shader)
+        add_dependencies(gta6rt gta6rt_indirect_count_shader gta6rt_compute_journal_shader)
+        add_test(NAME precompile_skip_list COMMAND ${CMAKE_COMMAND}
+          "-DGTA6RT=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+          "-DSPV_A=${_indirect_count_spv}" "-DSPV_B=${_journal_second_spv}"
+          "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/precompile_skip_list"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_precompile_skip_list.cmake")
+        set_tests_properties(precompile_skip_list PROPERTIES TIMEOUT 240 SKIP_REGULAR_EXPRESSION "SKIP: ")
+      endif()
+
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
       # device it gets, mapped and run by `gta6rt --run` with LEONIDA_D3D12=vulkan: the loader, the game thread, the
       # proxies and the Vulkan device in one process. check_tiny_frame.py reads the verdict, the binding and the
@@ -4696,12 +4706,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(console_heap_vsharp_slots_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME console_heap_vsharp_slots COMMAND console_heap_vsharp_slots_test)
-    # Host-RAM mirror of a console resource heap's GPU copy (src/console_heap_copy.h).
-    add_executable(console_heap_copy_test test/console_heap_copy_test.cpp)
+    # A slot-133 shadow keeps a GPU write until the title's bytes under it change (src/shadow_keep.h).
+    add_executable(shadow_keep_test test/shadow_keep_test.cpp)
     if(WIN32 AND MSVC)
-      target_compile_options(console_heap_copy_test PRIVATE /W4 /permissive- /utf-8)
+      target_compile_options(shadow_keep_test PRIVATE /W4 /permissive- /utf-8)
     endif()
-    add_test(NAME console_heap_copy COMMAND console_heap_copy_test)
+    add_test(NAME shadow_keep COMMAND shadow_keep_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
