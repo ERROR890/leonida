@@ -1737,17 +1737,14 @@ The copies:
     as VIctory keeps its copies of title memory (approach only). In a world run on the RX 7900 XTX the copies held
     4.4-6 GB of VRAM. The cost moves to the bus: the GPU reads every vertex and index of a copy from system memory,
     so a geometry-heavy pass can take longer; measure frame time with and without it before making it a default.
-  - **When a copy goes**: a view is retired when its title range is freed, decommitted or unmapped, and also when a
-    remap gives one of its pages another frame or none (`XMemMapPhysicalPages` with pages, the scatter call,
-    `CopyPageMappingsBatchX`; xmem's `RemapReleases`, `LEONIDA_GEOMETRY_REMAP_RELEASE=0` turns it off): the title
-    streams by remapping its pools' frames, and before this the copies of what those pages held stayed for the
-    device's life (`evicted 0` in every world run). A page mapped again to the frame it had is no change. A retired
+  - **When a copy goes**: a view is retired when its title range is freed, decommitted or unmapped. A remap of
+    physical pages retires nothing: the copies follow the new pages through the refresh. A retired
     view leaves the lookups at once, its alias ranges and translated heap slots are invalidated, its stream-pool
     extent is forgotten, and its memory is freed only after every ExecuteCommandLists replay in progress at the
     retirement has recorded its submissions and those have completed (`kAfterExecutes`). Before it leaves the
-    refresh it is copied once more from its pages if they are readable: a list recorded before a remap that took the
-    view's address (a root view) reads the new bytes, as on the console. The next view of the range makes a new copy.
-    `geometry_views_test` cases 14-16 and `xmem_test` (`test_remap_releases`) cover this without a GPU.
+    refresh it is copied once more from its pages if they are still readable (a heap block freed in memory that
+    stays committed). The next view of the range makes a new copy.
+    `geometry_views_test` cases 14-16 cover this without a GPU.
 - **Which pages changed** since the last refresh: where xmem reserved the title's memory with `MEM_WRITE_WATCH`
   (`XMemVirtualAlloc`'s ordinary regions and the title's `VirtualAlloc` reservations, not placeholders or
   physical-page windows), the kernel says (`GetWriteWatch` with reset, its answers kept for every copy over the page:
@@ -1759,6 +1756,15 @@ The copies:
   write-fault handler waits for the trackers' locks while the faulting thread may hold the process heap's lock (the
   title's `XMemAlloc` blocks are `_aligned_malloc`'s), so the state changed under those locks allocates from a heap of
   the runtime's own (`leonida::host_heap`), never the process heap.
+- **What the GPU wrote into a copy stays** until the title changes the bytes under it. Some pages are copied at
+  every refresh without a sign that the title wrote them (mapped at two addresses, left writable, reopened with the
+  64 KiB around a written page, write-watched or pinned); copied whole, they overwrote a value a compute program had
+  stored in the copy for the next frame with the title's unchanged bytes, so it read back as the title's old value
+  every other frame. `ShadowPages` keeps a 64-bit sum per 256-byte piece of the bytes it copied last
+  (`runtime/src/shadow_keep.h`) and copies a piece only when the title's bytes differ; a piece zeroed because its page
+  went away is copied again in full once it comes back. Limit: a title that writes the same bytes again to reset a
+  value the GPU changed is not seen (that needs the GPU's writes to reach the title's pages). `LEONIDA_SHADOW_KEEP=0`
+  copies every page as before.
 - **Only the title's memory** gets a copy: the blocks and ranges the xmem shims hand the title (`XMemAlloc`,
   `XMemAllocDefault`, `XMemVirtualAlloc`, the title's `VirtualAlloc`). An address anywhere else, the runtime's or a
   host DLL's memory included, is left as it was and counted, as is an arena VA or a buffer the layer made.
@@ -2635,8 +2641,9 @@ Pipeline creation:
   `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create
   (`cache-only`) is left as it is.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
-  compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
-  It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
+  compute programs at play and drops their dispatches, direct and indirect; the first dropped dispatch of each is
+  logged. It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
+  `--precompile-pipelines` (below) builds them anyway unless it is given `--skip-listed`.
   `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` also schedules a snapshot after a successful pipeline build,
   at most once per 120 seconds. It starts on the compile worker when queued builds have drained and the device
   has no active builds. The driver fills a mapped staging
@@ -2675,7 +2682,8 @@ Pipeline creation:
   folders can share one; the file names and the driver's checks keep a pipeline from one build from being taken
   for another's.
   `gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--all] [--smallest-first] [--limit N]
-  [--min-bytes N] [--max-bytes N] [--filter PART]... [--list]` fills the journal ahead of play, with no game: it
+  [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list]` fills the journal ahead of play, with
+  no game: it
   creates the Vulkan device as `--run` does (so the same environment gives the same journal names and driver keys:
   LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
   makes other pipelines) and builds every compute entry of the library through the dispatch path
@@ -2685,6 +2693,19 @@ Pipeline creation:
   4 threads: modules of 3.6-5.8 MB took 46-145 s each, 12 in 312 s, about 3.5 GB of host memory each while in the
   driver (14.5 GB peak for four). Graphics pipelines are not covered: they are built at a title's draw from its PSO
   description and the bound formats, and take milliseconds.
+  `LEONIDA_SKIP_COMPUTE` does not narrow the build: it is a play-time setting, players run the pre-compile with the
+  game's environment, and a program left out here would stay out of the journal after the list is shortened. The run
+  says how many entries the list names and builds them; `--skip-listed` leaves them out on purpose. The last line
+  counts what was built (compiled, or found in a cache), what was journaled already or being built by another
+  process, what failed, and what was left out and why: by `--skip-listed`, not buildable on this device (no SPIR-V,
+  set-0 bindings without a bindless set, workgroup memory over the limit), or filtered out (`--filter`, the size
+  bounds, `--limit`). The 89-167 s per program behind the skip list of the large `library/` programs came from
+  wave64-emulated packs. Measured with a native wave64 pack on an RX 7900 XTX (RADV, Mesa 26.3.1, Wine): all 721
+  programs of 2 MiB or more built, 360 of them in 170 s on 32 threads, 2.5-32 s each, the largest (13 MiB) in 28.5 s
+  alone, at a peak of 14 GiB of RAM for the process. With all of them in the journal and no skip list, two world runs
+  took them all from the journal (none built in the game) and ended as runs with the skip list do, in an idle-queue
+  device loss or a stop with the GPU idle ([running.md](running.md#settings-every-platform-needs)); whether their
+  output is correct is not measured.
   `LEONIDA_COMPILE_HELPER=1` (`shims/d3d12_compile_helper.h`) keeps first-ever compiles out of the title's process:
   the driver's locks, which a long `vkCreateComputePipelines` holds and a `vkQueueSubmit` of the same process waits
   for, are per process. A compute build of `LEONIDA_COMPILE_HELPER_MIN_BYTES` or more (128 KiB) with no journal file
@@ -4321,8 +4342,11 @@ Not implemented yet:
   vertices or indices, 2^26 vertex instances (count times instances), 65 535 groups per dimension, 2^20 groups per
   dispatch and a 2^27-unit work budget per call that saturates through an atomic compare-and-swap - and writes an
   empty record past `min(count, max_command_count)` and past the budget, and the clamped count word a `*Count` draw
-  then reads (so the count is at most `maxDrawCount`, VUID-vkCmdDrawIndirectCount-countBuffer-02717). The indirect
-  command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
+  then reads (so the count is at most `maxDrawCount`, VUID-vkCmdDrawIndirectCount-countBuffer-02717). A draw record
+  of 2^23 vertices or indices an instance or more is a slot the title has not filled: it runs empty and charges
+  nothing (RT-INDIRECT-DRAW-UNFILLED-COUNT). Before, each was cut to 2^24 and charged that, so eight of them used up
+  the budget and every later draw in the list ran empty; a census in a VIctory fork found 90 such records in one
+  list. The indirect command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
   memory barrier with a transfer access are not allowed inside a dynamic-rendering scope. The records are
   bit-identical to the application's when they are within the limits, the argument and count buffers are left
   untouched, and the scratch comes from a per-submission pool (`vulkan_scratch.h`) that a list with many indirect

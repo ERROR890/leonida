@@ -13,6 +13,9 @@
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
 //     CRT's exit lock. The thread-local destructor callback is kept here too, one per thread, and run by the
 //     loader when that thread ends. Not covered yet: at_quick_exit() handlers (quick_exit() runs none).
+//     CRT's exit lock. Not covered yet: at_quick_exit() handlers (quick_exit() runs none).
+//   - the EXE's thread-local destructor callback (_register_thread_local_exe_atexit_callback) is kept here too:
+//     exit() and _cexit() call it before the atexit handlers, as the UCRT does (see game_exit below).
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
@@ -158,6 +161,28 @@ OnexitFn __cdecl game_onexit(OnexitFn fn) {
     return fn && register_atexit(reinterpret_cast<AtexitFn>(fn)) ? fn : nullptr;
 }
 
+// ---- the EXE's thread-local destructors
+// An MSVC EXE's startup passes vcruntime's TLS destructor callback, which its TLS directory also lists, to
+// _register_thread_local_exe_atexit_callback (UCRT process.h: void __cdecl (_tls_callback_type), where
+// _tls_callback_type is void (__stdcall*)(void*, unsigned long, void*)). The UCRT calls it as
+// (nullptr, DLL_PROCESS_DETACH, nullptr) when exit() or _cexit() starts, before the atexit table: the leaving thread's
+// thread_local objects end before the static ones, as C++ requires. Other threads' end through the loader's
+// thread-detach notification, which calls the same function from the TLS directory, so it is not called here then.
+// The host CRT cannot take it: the UCRT accepts one per process and fast-fails the second (gta6rt's own startup
+// registers the first, so the title stopped at boot on Windows), and Wine's ucrtbase replaces gta6rt's own and never
+// calls the title's, because the run ends through end_run.
+using TlsCallback = void(__stdcall*)(void*, unsigned long, void*);
+std::atomic<TlsCallback> g_thread_local_exit_callback{nullptr};
+
+void __cdecl game_register_thread_local_exe_atexit_callback(TlsCallback callback) {
+    g_thread_local_exit_callback.store(callback);
+}
+// Once per run, like the UCRT's exit path: a later exit() after _cexit() finds nothing left to run.
+void run_thread_local_exe_atexit_callback() {
+    if (const TlsCallback callback = g_thread_local_exit_callback.exchange(nullptr))
+        callback(nullptr, DLL_PROCESS_DETACH, nullptr);
+}
+
 // ---- the way out
 // The CRT's exit lock, which exit(), _exit(), _Exit() and quick_exit() all take: the first thread to leave owns it
 // and ends the run; any other thread that tries to leave waits forever. The owner may leave again from a handler
@@ -173,7 +198,10 @@ bool take_exit_lock() {
 }
 // exit(): the game's handlers and static destructors, then the end of the run.
 void __cdecl game_exit(int code) {
-    if (take_exit_lock()) run_atexit_handlers();
+    if (take_exit_lock()) {
+        run_thread_local_exe_atexit_callback();
+        run_atexit_handlers();
+    }
     end_run(code);
 }
 // _exit(), _Exit(), quick_exit(): the end of the run without the atexit handlers.
@@ -183,6 +211,7 @@ void __cdecl game_quick_exit(int code) {
 }
 // _cexit() runs the handlers and flushes the streams, then returns; _c_exit() only returns.
 void __cdecl game_cexit() {
+    run_thread_local_exe_atexit_callback();
     run_atexit_handlers();
     std::fflush(nullptr);
 }
@@ -518,6 +547,8 @@ using namespace rt::process;
     {dll, "_register_thread_local_exe_atexit_callback", reinterpret_cast<void*>(&game_register_thread_local_exe_atexit_callback)}, \
     {dll, "_cexit", reinterpret_cast<void*>(&game_cexit)}, {dll, "_c_exit", reinterpret_cast<void*>(&game_c_exit)}, \
     {dll, "abort", reinterpret_cast<void*>(&game_abort)}, {dll, "__p___argc", reinterpret_cast<void*>(&game_p_argc)}, \
+    {dll, "_register_thread_local_exe_atexit_callback", \
+     reinterpret_cast<void*>(&game_register_thread_local_exe_atexit_callback)}, \
     {dll, "__p___argv", reinterpret_cast<void*>(&game_p_argv)}, \
     {dll, "__p___wargv", reinterpret_cast<void*>(&game_p_wargv)}, \
     {dll, "_configure_narrow_argv", reinterpret_cast<void*>(&game_configure_narrow_argv)}, \
